@@ -1,0 +1,329 @@
+// hw_stats.c
+// GTK4 + Cairo temperature graph with retained history and labels.
+// Build: gcc $(pkg-config --cflags gtk4) -o hw_stats hw_stats.c $(pkg-config --libs gtk4)
+
+#include <gtk/gtk.h>
+#include <cairo.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#define HISTORY_SIZE 200    // how many points we keep
+#define GRAPH_HEIGHT 140    // graph pixel height
+#define GRAPH_MARGIN 10     // left/right margin
+#define MEM_LINES 6         // lines to read from /proc/meminfo
+
+/* UI widgets */
+static GtkWidget *label_perf;   // performance label (top)
+static GtkWidget *label_mem;    // memory label (below perf)
+static GtkWidget *drawing_area; // cairo drawing area (graph)
+
+/* Data */
+static double temp_history[HISTORY_SIZE];
+static int history_count = 0; // how many valid samples (<= HISTORY_SIZE)
+
+/* --- Helpers: read temperature (vagile, supports vcgencmd fallback) --- */
+static int parse_temp_from_string(const char *s, double *out_temp) {
+    // Try to find a number (e.g. "temp=42.3'C" or "42.3")
+    const char *p = s;
+    int found_digit = 0;
+    double val = 0.0;
+    double frac = 0.0;
+    double scale = 1.0;
+    int in_frac = 0;
+    while (*p) {
+        if (isdigit((unsigned char)*p)) {
+            found_digit = 1;
+            int d = *p - '0';
+            if (!in_frac) {
+                val = val * 10.0 + d;
+            } else {
+                frac = frac * 10.0 + d;
+                scale *= 10.0;
+            }
+        } else if (*p == '.' && found_digit && !in_frac) {
+            in_frac = 1;
+        } else if (found_digit) {
+            // stop at first non-digit after digits (we've got a number)
+            break;
+        }
+        p++;
+    }
+    if (!found_digit) return 0;
+    if (scale > 1.0) val += frac / scale;
+    *out_temp = val;
+    return 1;
+}
+
+static double read_temperature() {
+    double temp = 0.0;
+    FILE *fp = popen("vcgencmd measure_temp 2>/dev/null", "r");
+    if (fp) {
+        char buf[128];
+        if (fgets(buf, sizeof(buf), fp) != NULL) {
+            if (parse_temp_from_string(buf, &temp)) {
+                pclose(fp);
+                return temp;
+            }
+        }
+        pclose(fp);
+    }
+
+    // fallback: read CPU thermal zone (common on Linux)
+    fp = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
+    if (fp) {
+        long milli = 0;
+        if (fscanf(fp, "%ld", &milli) == 1) {
+            temp = milli / 1000.0;
+            fclose(fp);
+            return temp;
+        }
+        fclose(fp);
+    }
+
+    // final fallback: return 0 (should not normally happen)
+    return 0.0;
+}
+
+/* --- Read a few lines from /proc/meminfo to display --- */
+static void build_mem_string(char *out, size_t outsz) {
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) {
+        snprintf(out, outsz, "Memory: unable to open /proc/meminfo\n");
+        return;
+    }
+    char line[256];
+    int count = 0;
+    out[0] = '\0';
+    while (count < MEM_LINES && fgets(line, sizeof(line), fp)) {
+        // trim newline
+        size_t L = strlen(line);
+        if (L && line[L-1] == '\n') line[L-1] = '\0';
+        strncat(out, "  ", outsz - strlen(out) - 1);
+        strncat(out, line, outsz - strlen(out) - 1);
+        strncat(out, "\n", outsz - strlen(out) - 1);
+        count++;
+    }
+    fclose(fp);
+    // Add CPU stats in /proc/stat
+    FILE *cpu_fp = fopen("/proc/stat", "r");
+    if (cpu_fp) {
+        char cpu_line[256];
+        if (fgets(cpu_line, sizeof(cpu_line), cpu_fp)) {
+            // Trim newline
+            size_t len = strlen(cpu_line);
+            if (len && cpu_line[len - 1] == '\n') cpu_line[len - 1] = '\0';
+            strncat(out, "  ", outsz - strlen(out) - 1);
+            strncat(out,"Cpu:",4);
+            strncat(out, cpu_line+3, 10);
+        }
+        fclose(cpu_fp);
+    } else {
+        strncat(out, "  CPU: unable to open /proc/stat\n", outsz - strlen(out) - 1);
+    }
+}
+
+
+/* --- Add a new temperature sample, keep history (scroll left) --- */
+static void add_temperature_sample(double t) {
+    if (history_count < HISTORY_SIZE) {
+        temp_history[history_count++] = t;
+        return;
+    }
+    // shift left by 1
+    memmove(&temp_history[0], &temp_history[1], sizeof(double) * (HISTORY_SIZE - 1));
+    temp_history[HISTORY_SIZE - 1] = t;
+}
+
+/* --- Draw graph with Cairo --- */
+static void draw_graph_cairo(cairo_t *cr, int width, int height) {
+    // background
+    cairo_set_source_rgb(cr, 0.06, 0.06, 0.06);
+    cairo_rectangle(cr, 0, 0, width, height);
+    cairo_fill(cr);
+
+    // graph area
+    int g_x = GRAPH_MARGIN;
+    int g_w = width - 2 * GRAPH_MARGIN;
+    int g_h = GRAPH_HEIGHT;
+
+    // Position graph near bottom of drawing area
+    int g_y = height - g_h - 8; // 8 px padding from bottom
+
+    // draw border
+    cairo_set_line_width(cr, 1.0);
+    cairo_set_source_rgb(cr, 0.25, 0.25, 0.25);
+    cairo_rectangle(cr, g_x - 1, g_y - 1, g_w + 2, g_h + 2);
+    cairo_stroke(cr);
+
+    // grid lines (horizontal)
+    cairo_set_source_rgba(cr, 1, 1, 1, 0.06);
+    for (int i = 0; i <= 4; ++i) {
+        double yy = g_y + (g_h * i / 4.0);
+        cairo_move_to(cr, g_x, yy);
+        cairo_line_to(cr, g_x + g_w, yy);
+    }
+    cairo_stroke(cr);
+
+    double minv = 40.0; // minimum temperature
+    double maxv = 70.0; // maximum temperature
+
+    // axes labels (min/max)
+    char lab[64];
+    cairo_set_font_size(cr, 12);
+    cairo_set_source_rgb(cr, 1, 1, 1);
+    snprintf(lab, sizeof(lab), "%.1f°C", maxv);
+    cairo_move_to(cr, g_x + g_w + 6, g_y + 10);
+    cairo_show_text(cr, lab);
+    snprintf(lab, sizeof(lab), "%.1f°C", minv);
+    cairo_move_to(cr, g_x + g_w + 6, g_y + g_h);
+    cairo_show_text(cr, lab);
+
+    // draw polyline for temps
+    if (history_count > 0) {
+        double step_x = (double)g_w / (double)(HISTORY_SIZE - 1); // full window width uses HISTORY_SIZE points
+        // we want to align right (latest at far right), compute starting index
+        int start_index = history_count < HISTORY_SIZE ? 0 : 0;
+        // to keep older visible when buffer not full, we map points into [0 .. history_count-1]
+        int points = history_count;
+        double x0 = g_x;
+        for (int i = 0; i < points; ++i) {
+            // i maps to screen x: x = g_x + (i * g_w) / (points - 1)  (if points>1)
+            double x = (points > 1) ? (g_x + ((double)i * g_w) / (points - 1)) : (g_x + g_w);
+            double normalized = (temp_history[i] - minv) / (maxv - minv);
+            double y = g_y + (g_h - normalized * g_h);
+            if (i == 0) cairo_move_to(cr, x, y);
+            else cairo_line_to(cr, x, y);
+        }
+
+        // stroke the temperature line
+        cairo_set_source_rgb(cr, 0.1, 0.9, 0.2); // green
+        cairo_set_line_width(cr, 2.0);
+        cairo_stroke(cr);
+
+        // draw latest point marker
+        double latest_x = (points > 1) ? (g_x + ((double)(points - 1) * g_w) / (points - 1)) : (g_x + g_w);
+        double latest_y = g_y + (g_h - ((temp_history[points - 1] - minv) / (maxv - minv)) * g_h);
+        cairo_arc(cr, latest_x, latest_y, 3.0, 0, 2 * G_PI);
+        cairo_fill(cr);
+    }
+
+    // graph title
+    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_set_font_size(cr, 14);
+    cairo_move_to(cr, g_x, g_y - 8);
+    cairo_show_text(cr, "Temperature (°C) - Last 200 Seconds");
+}
+
+/* --- GTK draw callback for drawing area --- */
+/* GTK4 uses gtk_drawing_area_set_draw_func; draw function signature below. */
+static void on_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
+    // Fill background (for the whole area)
+    cairo_set_source_rgb(cr, 0.06, 0.06, 0.06);
+    cairo_rectangle(cr, 0, 0, width, height);
+    cairo_fill(cr);
+
+    // Show the two labels area (we will leave labels as GTK labels above, not draw text here)
+    // Draw the graph region at bottom
+    draw_graph_cairo(cr, width, height);
+}
+
+/* --- The periodic update function (every second) --- */
+static gboolean update_stats(gpointer user_data) {
+    // Read temperature
+    double t = read_temperature();
+    if (t <= 0.0) {
+        // if no valid reading, produce a safe placeholder
+        t = 0.0;
+    }
+    add_temperature_sample(t);
+
+    // Update performance label (use markup and bigger header)
+    char perf_buf[256];
+    snprintf(perf_buf, sizeof(perf_buf),
+             "<span size='large' weight='bold'>Performance Data:</span>\n  Temperature: %.2f °C",
+             t);
+    gtk_label_set_markup(GTK_LABEL(label_perf), perf_buf);
+
+    // Update memory label (first few lines of /proc/meminfo)
+    char mem_buf[1024];
+    build_mem_string(mem_buf, sizeof(mem_buf));
+    // Prepend header with markup
+    char mem_out[1150];
+    snprintf(mem_out, sizeof(mem_out),
+             "<span size='large' weight='bold'>Memory Data:</span>\n%s", mem_buf);
+    gtk_label_set_markup(GTK_LABEL(label_mem), mem_out);
+
+    // Trigger graph redraw
+    gtk_widget_queue_draw(drawing_area);
+
+    return G_SOURCE_CONTINUE; // continue calling
+}
+
+/* --- Activate: build UI --- */
+static void activate(GtkApplication *app, gpointer user_data) {
+    GtkWidget *window = gtk_application_window_new(app);
+    gtk_window_set_title(GTK_WINDOW(window), "HW_Stats (GTK4 + Cairo)");
+    gtk_window_set_default_size(GTK_WINDOW(window), 820, 480);
+
+    // vertical box: two labels then a drawing area
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_window_set_child(GTK_WINDOW(window), vbox);
+    gtk_widget_set_margin_top(vbox, 10);
+    gtk_widget_set_margin_bottom(vbox, 10);
+    gtk_widget_set_margin_start(vbox, 10);
+    gtk_widget_set_margin_end(vbox, 10);
+
+    // Performance Label - big header
+    label_perf = gtk_label_new(NULL);
+    gtk_label_set_xalign(GTK_LABEL(label_perf), 0.0); // left align
+    gtk_label_set_use_markup(GTK_LABEL(label_perf), TRUE);
+    gtk_widget_set_hexpand(label_perf, TRUE);
+    gtk_widget_set_vexpand(label_perf, FALSE);
+
+    // Memory Label
+    label_mem = gtk_label_new(NULL);
+    gtk_label_set_xalign(GTK_LABEL(label_mem), 0.0);
+    gtk_label_set_use_markup(GTK_LABEL(label_mem), TRUE);
+    gtk_label_set_wrap(GTK_LABEL(label_mem), TRUE);
+    gtk_label_set_wrap_mode(GTK_LABEL(label_mem), PANGO_WRAP_WORD_CHAR);
+    gtk_widget_set_hexpand(label_mem, TRUE);
+    gtk_widget_set_vexpand(label_mem, FALSE);
+
+    // Drawing area for the graph
+    drawing_area = gtk_drawing_area_new();
+    // set minimal height for our graph area
+    gtk_widget_set_size_request(drawing_area, -1, GRAPH_HEIGHT + 60);
+    // Connect the draw callback using GTK4 function
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(drawing_area), (GtkDrawingAreaDrawFunc)on_draw, NULL, NULL);
+
+    // Pack widgets
+    gtk_box_append(GTK_BOX(vbox), label_perf);
+    gtk_box_append(GTK_BOX(vbox), label_mem);
+    gtk_box_append(GTK_BOX(vbox), drawing_area);
+
+    // Initialize history with current reading so graph isn't blank
+    double init_t = read_temperature();
+    if (init_t <= 0.0) init_t = 40.0;
+    for (int i = 0; i < HISTORY_SIZE; ++i) temp_history[i] = init_t;
+    history_count = HISTORY_SIZE;
+
+    // Start periodic updates every second
+    g_timeout_add_seconds(1, update_stats, NULL); // drawing area is global; update_stats uses it
+
+    gtk_window_present(GTK_WINDOW(window));
+}
+
+/* --- main --- */
+int main(int argc, char **argv) {
+    gtk_init(); // initialize GTK internals
+
+    GtkApplication *app = gtk_application_new("org.example.hwstats", G_APPLICATION_DEFAULT_FLAGS);
+    g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
+
+    int status = g_application_run(G_APPLICATION(app), argc, argv);
+    g_object_unref(app);
+    return status;
+}
+
